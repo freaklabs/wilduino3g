@@ -3,7 +3,7 @@
 //
 //
 /************************************************************************/
-#include "saboten3g.h"
+#include "wilduino3g.h"
 
 #define DEBUG 1
 
@@ -11,22 +11,48 @@
 #if (DEBUG == 1)
   #define DBG_PRINT(...)   dbg->print(__VA_ARGS__)
   #define DBG_PRINTLN(...) dbg->println(__VA_ARGS__)
+  #define DBG_PRINTF(...)   printf(__VA_ARGS__)
 #else
   #define DBG_PRINT(...)
   #define DBG_PRINTLN(...)
+  #define DBG_PRINTF(...) 
 #endif
 
+#define MAX_POWER_WAIT 10000
 
 static char tmp[500];
 volatile boolean rtcFlag = false;
+uint8_t pwrRetries;
+
+uint8_t state = STATE_MODULE_POWER_OFF;
+uint8_t nextState = STATE_MODULE_POWER_OFF;
+uint32_t now = 0;
 
 /************************************************************************/
 // 
 //
 //
 /************************************************************************/
-Saboten3G::Saboten3G()
+Wilduino3G::Wilduino3G()
 {
+    rtcFlag = false;
+}
+
+/************************************************************************/
+// 
+//
+//
+/************************************************************************/
+boolean Wilduino3G::begin(HardwareSerial *port, HardwareSerial *debug)
+{
+    uint8_t reg;
+
+    ser = port;
+    dbg = debug;
+
+    ser->begin(115200);
+    dbg->begin(57600);
+
     pinMode(pinPwrButton, OUTPUT);
     digitalWrite(pinPwrButton, HIGH);
 
@@ -38,47 +64,12 @@ Saboten3G::Saboten3G()
 
     pinMode(pinWake, OUTPUT);
     digitalWrite(pinWake, HIGH);
-
-    pinMode(pinCdet, INPUT);
-    digitalWrite(pinCdet, HIGH);
-
-    pinMode(pinLevelEnb, OUTPUT);
-    digitalWrite(pinLevelEnb, LOW);
-
-    pinMode(pinGpsEnb, OUTPUT);
-    digitalWrite(pinGpsEnb, LOW);
     
     pinMode(pin3GRstN, OUTPUT);
     digitalWrite(pin3GRstN, HIGH);
 
     pinMode(pinArefEnb, OUTPUT);
     digitalWrite(pinArefEnb, LOW);
-
-    pinMode(10, OUTPUT);
-    digitalWrite(10, HIGH);
-
-    rtcFlag = false;
-
-    Wire.begin();
-}
-
-/************************************************************************/
-// 
-//
-//
-/************************************************************************/
-boolean Saboten3G::begin(HardwareSerial *port, SoftwareSerial *gpsSerial, HardwareSerial *debug)
-{
-    uint8_t reg;
-
-    ser = port;
-    dbg = debug;
-    gps = gpsSerial;
-
-    ser->begin(115200);
-    dbg->begin(57600);
-    gps->begin(9600);
-
 
     DS3231_init(DS3231_INTCN);
 
@@ -90,7 +81,7 @@ boolean Saboten3G::begin(HardwareSerial *port, SoftwareSerial *gpsSerial, Hardwa
     reg &= ~(DS3231_OSF | DS3231_EN32K);
     rtcSetStatus(reg);
 
-    attachInterrupt(RTC_INTP, Saboten3G::rtcIntp, FALLING); 
+    attachInterrupt(intpNumRtc, Wilduino3G::rtcIntp, FALLING); 
 
     sdBegin(pinSdSeln);
     file.dateTimeCallback(sdDateTime);
@@ -98,7 +89,9 @@ boolean Saboten3G::begin(HardwareSerial *port, SoftwareSerial *gpsSerial, Hardwa
     // use external 2.5V reference
     analogReference(EXTERNAL);
 
+    DBG_PRINTLN(F("Wilduino 3G Driver v0.5"));
     DBG_PRINTLN(F("Initialization complete"));
+
     return true;
 }
 
@@ -107,7 +100,7 @@ boolean Saboten3G::begin(HardwareSerial *port, SoftwareSerial *gpsSerial, Hardwa
 //
 //
 /************************************************************************/
-void Saboten3G::poll()
+void Wilduino3G::poll()
 {
     /*
     if (ser->available())
@@ -122,7 +115,7 @@ void Saboten3G::poll()
 //
 //
 /************************************************************************/
-uint8_t Saboten3G::getIntp()
+uint8_t Wilduino3G::getIntp()
 {
     if (rtcFlag)
     {
@@ -151,7 +144,7 @@ uint8_t Saboten3G::getIntp()
 
         rtcClearAlarm(alm);
         rtcEnableAlarm(alm);
-            return alm;
+        return alm;
     }
     else
     {
@@ -164,7 +157,7 @@ uint8_t Saboten3G::getIntp()
 //
 //
 /********************************************************************/
-void Saboten3G::rtcIntp()
+void Wilduino3G::rtcIntp()
 {
   rtcFlag = true;
 }
@@ -174,7 +167,7 @@ void Saboten3G::rtcIntp()
 //
 //
 /********************************************************************/
-boolean Saboten3G::rtcIntpRcvd()
+boolean Wilduino3G::rtcIntpRcvd()
 {
     return rtcFlag;
 }
@@ -183,11 +176,154 @@ boolean Saboten3G::rtcIntpRcvd()
 // 3G Driver related functions
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+/********************************************************************/
+//
+//  pollModuleFSM()
+//  Module state machine handler
+//
+/********************************************************************/
+void Wilduino3G::pollModuleFSM()
+{
+    wdt_reset();
+    switch (state)
+    {
+        case STATE_MODULE_POWER_OFF:
+            pwrRetries = 0;
+            if (drvrGetPwrStatus() == HIGH)
+            {
+                // power is on
+                DBG_PRINTLN(F("STATE_MODULE_POWER_OFF: Module shutting down."));
+                if (drvrPowerOff())
+                {
+                    nextState = STATE_MODULE_SHUTTING_DOWN;
+                    now = millis();
+                }
+            }
+        break;
+
+        case STATE_MODULE_POWER_ON:
+            if (pwrRetries < MAX_POWER_RETRIES)
+            {
+                DBG_PRINTLN(F("Turning ON"));
+                dbg->flush();
+                drvrTogglePower();
+                now = millis();
+                nextState = STATE_MODULE_POWER_ON_WAIT;
+            }
+            else
+            {
+                DBG_PRINTLN(F("ERROR: Module Not Powered On"));
+                DBG_PRINTLN(F("STATE_MODULE_POWER_ON: Transitioning to STATE_MODULE_SHUTTING_DOWN"));
+                drvrPowerOff();
+                pwrRetries = 0;
+                nextState = STATE_MODULE_SHUTTING_DOWN;
+                now = millis();
+            }
+        break;
+
+        case STATE_MODULE_POWER_ON_WAIT:
+            if (drvrElapsedTime(now) < MAX_POWER_WAIT)
+            {
+                wdt_reset();
+
+                // check if module is powered up
+                if (drvrGetPwrStatus() == HIGH)
+                {          
+                    // check if init sequence done
+                    if (drvrInitDone())
+                    {
+                        // check if command line is responsive
+                        if (drvrCheckReady())
+                        {
+                            nextState = STATE_MODULE_READY;
+                            DBG_PRINTLN(F("STATE_MODULE_POWER_ON: Transitioning to STATE_MODULE_READY"));
+                        }  
+                    }      
+                } 
+            }
+            else
+            {
+                DBG_PRINTF("Failed. Retrying on retry #%d.\n", pwrRetries);
+                DBG_PRINTLN(F("STATE_MODULE_POWER_ON: Transitioning to STATE_MODULE_POWER_ON"));
+                nextState = STATE_MODULE_POWER_ON;
+                pwrRetries++;
+            } 
+        break;
+
+        case STATE_MODULE_READY:
+        break;
+
+        case STATE_MODULE_SHUTTING_DOWN:
+            if (drvrElapsedTime(now) < MAX_POWER_WAIT)
+            {
+                if (drvrGetPwrStatus() == LOW)
+                {                
+                    nextState = STATE_MODULE_POWER_OFF;
+                    DBG_PRINTLN(F("STATE_MODULE_SHUTTING_DOWN: Transitioning to STATE_MODULE_POWER_OFF"));
+                } 
+            }
+            else
+            {
+                if (drvrGetPwrStatus() == HIGH)
+                {
+                    drvrPowerOff();
+                    now = millis();
+                }
+            }
+        break;
+
+        default:
+            nextState = STATE_MODULE_POWER_OFF;
+            DBG_PRINTLN(F("ERROR: We are in DEFAULT case"));
+            DBG_PRINTLN(F("DEFAULT CASE: Transitioning to STATE_MODULE_POWER_OFF"));
+        break;
+    }
+    state = nextState;
+}
+
+/************************************************************************/
+//    
+//    
+/************************************************************************/
+uint8_t Wilduino3G::getModuleState()
+{
+     return state;
+}
+
+/************************************************************************/
+//    
+//    
+/************************************************************************/
+void Wilduino3G::stateModulePwrOn()
+{
+    nextState = STATE_MODULE_POWER_ON;
+}
+
+/************************************************************************/
+//    
+//    
+/************************************************************************/
+void Wilduino3G::stateModulePwrOff()
+{
+    nextState = STATE_MODULE_SHUTTING_DOWN;
+    drvrPowerOff();
+    now = millis();
+}
+
+/************************************************************************/
+//    getPwrStatus
+//    Get power status of module
+/************************************************************************/
+uint8_t Wilduino3G::drvrGetPwrStatus()
+{
+     return digitalRead(pinPwrStatus);
+}
+
 /************************************************************************/
 //    flushSerInput
 //    Removes any data from receive input
 /************************************************************************/
-void Saboten3G::drvrFlush()
+void Wilduino3G::drvrFlush()
 {
     while (ser->available() > 0)
     {
@@ -199,12 +335,16 @@ void Saboten3G::drvrFlush()
 //    reset 3G Module
 //    Reset 3G module
 /************************************************************************/
-void Saboten3G::drvrHardReset()
+void Wilduino3G::drvrHardReset()
 {
     digitalWrite(pin3GRstN, LOW);
     delay(500);
     digitalWrite(pin3GRstN, HIGH);
     delay(500);
+    while (!drvrInitDone()) 
+    {
+        ;
+    }
 }
 
 
@@ -213,7 +353,7 @@ void Saboten3G::drvrHardReset()
 //
 //
 /************************************************************************/
-void Saboten3G::drvrCmdEcho(boolean enable) 
+void Wilduino3G::drvrCmdEcho(boolean enable) 
 {
     if (enable)
     {
@@ -231,7 +371,7 @@ void Saboten3G::drvrCmdEcho(boolean enable)
 //
 //
 /************************************************************************/
-void Saboten3G::drvrSend(const char* command) 
+void Wilduino3G::drvrSend(const char* command) 
 {
     drvrFlush();
 
@@ -244,7 +384,7 @@ void Saboten3G::drvrSend(const char* command)
 //
 //
 /************************************************************************/
-boolean Saboten3G::drvrCheckResp(const char *expected, uint32_t timeout)
+boolean Wilduino3G::drvrCheckResp(const char *expected, uint32_t timeout)
 {
     uint32_t now;
     boolean respRcvd = false;
@@ -262,6 +402,7 @@ boolean Saboten3G::drvrCheckResp(const char *expected, uint32_t timeout)
             respBuf[idx++] = c;
             if (idx == RESP_SZ-1)
             {
+                // too much data in response buffer
                 break;
             }
 
@@ -289,12 +430,12 @@ boolean Saboten3G::drvrCheckResp(const char *expected, uint32_t timeout)
 //  
 //
 /************************************************************************/
-boolean Saboten3G::drvrCheckOK(uint32_t timeout)
+boolean Wilduino3G::drvrCheckOK(uint32_t timeout)
 {
    
     if (drvrCheckResp("OK\r\n", timeout))
     {
-      DBG_PRINTLN("Command Success");
+      //DBG_PRINTLN("Command Success");
       return true;
     }
     else
@@ -309,7 +450,7 @@ boolean Saboten3G::drvrCheckOK(uint32_t timeout)
 //
 //
 /************************************************************************/
-void Saboten3G::drvrDumpResp()
+void Wilduino3G::drvrDumpResp()
 {
   dbg->print(respBuf);
 }
@@ -317,10 +458,10 @@ void Saboten3G::drvrDumpResp()
 /**************************************************************************/
 // 
 /**************************************************************************/
-void Saboten3G::drvrSleepMcu()
+void Wilduino3G::drvrSleepMcu()
 {
-    uint8_t portBReg, portCReg, portDReg;
-    uint8_t ddrBReg, ddrCReg, ddrDReg;
+    uint8_t portCReg, portDReg;
+    uint8_t ddrCReg, ddrDReg;
 
     // LOG
 
@@ -366,7 +507,7 @@ void Saboten3G::drvrSleepMcu()
 /**************************************************************************/
 // 
 /**************************************************************************/
-float Saboten3G::drvrGetVbat()
+float Wilduino3G::drvrGetVbat()
 {
     uint16_t bat;
     float volts;
@@ -382,7 +523,7 @@ float Saboten3G::drvrGetVbat()
 /**************************************************************************/
 // 
 /**************************************************************************/
-float Saboten3G::drvrGetVsol()
+float Wilduino3G::drvrGetVsol()
 {
     uint16_t sol;
     float volts;
@@ -398,7 +539,7 @@ float Saboten3G::drvrGetVsol()
 /**************************************************************************/
 // 
 /**************************************************************************/
-void Saboten3G::drvrWriteDevId(uint16_t id)
+void Wilduino3G::drvrWriteDevId(uint16_t id)
 {
     while(!eeprom_is_ready());
     eeprom_write_block(&id, DEV_ID_EEPROM_LOC, 2);
@@ -407,7 +548,7 @@ void Saboten3G::drvrWriteDevId(uint16_t id)
 /**************************************************************************/
 // 
 /**************************************************************************/
-uint16_t Saboten3G::drvrReadDevId()
+uint16_t Wilduino3G::drvrReadDevId()
 {
     uint16_t id;
     while(!eeprom_is_ready());
@@ -418,59 +559,23 @@ uint16_t Saboten3G::drvrReadDevId()
 /**************************************************************************/
 // 
 /**************************************************************************/
-boolean Saboten3G::drvrPowerOn()
+void Wilduino3G::drvrTogglePower()
 {
-    uint8_t resp = false;
-    
-    for (int i=0; i<POWER_RETRIES; i++)
-    {
-        DBG_PRINTLN("POWERON");
-        // turn on power switch for modem
-        digitalWrite(pinPwrButton, LOW);
-        delay(2000);
-        digitalWrite(pinPwrButton, HIGH);
-        delay(2000);
-
-        wdt_reset(); // kick the dog
-
-        // check to see if it powered up properly
-        if ((resp = drvrCheckResp("PB DONE\r\n", 7000)) == true)
-        {
-            break;
-        }
-
-        wdt_reset();
-        
-        // check to see if power is on. If it is, then break also
-        drvrSend("ATI\r\n");
-        if (drvrCheckOK(2000))
-        {
-            resp = true;
-            break;
-        }
-    }
-    
-    return resp;
+    // turn on power switch for modem
+    digitalWrite(pinPwrButton, LOW);
+    delay(1000);
+    digitalWrite(pinPwrButton, HIGH);
 }
 
 /**************************************************************************/
 // 
 /**************************************************************************/
-boolean Saboten3G::drvrPowerOff()
+boolean Wilduino3G::drvrPowerOff()
 {
-    // check to see if power is on. If it is, then break also
-    for (int i=0; i<POWER_RETRIES; i++)
+    drvrSend("AT+CPOF\r\n");
+    if (drvrCheckOK(2000))
     {
-        drvrSend("ATI\r\n");
-        if (drvrCheckOK(2000))
-        {
-            // turn off power switch for modem
-            digitalWrite(pinPwrButton, LOW);
-            delay(2000);
-            digitalWrite(pinPwrButton, HIGH);
-            delay(2000);
-            return true;
-        }
+        return true;
     }
     return false;
 }
@@ -478,7 +583,33 @@ boolean Saboten3G::drvrPowerOff()
 /**************************************************************************/
 // 
 /**************************************************************************/
-boolean Saboten3G::drvrReset()
+boolean Wilduino3G::drvrInitDone()
+{
+    // check to see if it powered up properly
+    if (drvrCheckResp("PB DONE\r\n", 7000))
+    {
+        return true;
+    }
+    return false;
+}
+
+/**************************************************************************/
+// 
+/**************************************************************************/
+boolean Wilduino3G::drvrCheckReady()
+{
+    drvrSend("AT\r\n");
+    if (drvrCheckOK(2000))
+    {
+        return true;
+    }
+    return false;
+}
+
+/**************************************************************************/
+// 
+/**************************************************************************/
+boolean Wilduino3G::drvrReset()
 {
     drvrSend("AT+CRESET");
     return (drvrCheckOK(DEFAULT_TIMEOUT));
@@ -488,7 +619,7 @@ boolean Saboten3G::drvrReset()
 // elapsedTime - calculates time elapsed from startTime
 // startTime : time to start calculating
 /************************************************************************/
-uint32_t Saboten3G::drvrElapsedTime(uint32_t startTime)
+uint32_t Wilduino3G::drvrElapsedTime(uint32_t startTime)
 {
   uint32_t stopTime = millis();
   
@@ -505,7 +636,7 @@ uint32_t Saboten3G::drvrElapsedTime(uint32_t startTime)
 /**************************************************************************/
 // 
 /**************************************************************************/
-void Saboten3G::drvrFlightMode(boolean enable)
+void Wilduino3G::drvrFlightMode(boolean enable)
 {
     uint8_t val = (enable == false);
     digitalWrite(pinFlightMode, val);
@@ -521,7 +652,7 @@ void Saboten3G::drvrFlightMode(boolean enable)
 //    get info from modules
 //
 /********************************************************************/
-void Saboten3G::mgmtGetInfo()
+void Wilduino3G::mgmtGetInfo()
 {
     DBG_PRINTLN("Sending ATI command");
     drvrSend("ATI\r\n");
@@ -530,40 +661,62 @@ void Saboten3G::mgmtGetInfo()
 
 /********************************************************************/
 //    
+
 //
 /********************************************************************/
-int8_t Saboten3G::mgmtGetRSSI()
+int8_t Wilduino3G::mgmtGetRSSI()
 {
-    char key[] = " +:,\n";
-    char *p;
-
-    DBG_PRINTLN("Sending AT+CSQ command");
+    uint32_t now;
     drvrSend("AT+CSQ\r\n");
-    if (drvrCheckOK(DEFAULT_TIMEOUT))
-    {
-        drvrDumpResp();
-    }
-    else
-    {
-        DBG_PRINTLN("Could not get RSSI");
-        return -1;
-    }
+    now = millis();
 
-    p = strtok(respBuf, key);
-    while (p)
+    while (drvrElapsedTime(now) < DEFAULT_TIMEOUT)
     {
-      p = strtok(NULL, key);
-      if (memcmp(p, "CSQ", sizeof("CSQ")) == 0)
-      {
-          p = strtok(NULL, key);
-          rssi = atoi(p);
-            return rssi;
-      }
-
-    }
+        if (ser->available() > 0)
+        {
+            String str = ser->readStringUntil('\n');
+            //dbg->print("Signal Quality Received: ");
+            //dbg->println(str);
+            
+            if (str.indexOf("+CSQ:") != -1)
+            {
+                String substr = str.substring(str.indexOf(':')+1, str.indexOf(','));
+                substr.trim();
+                //printf("Correct response received: %s\r\n", substr.c_str());
+                return substr.toInt();
+            }
+        }
+    }    
     return -1;
 }
 
+/********************************************************************/
+//    
+
+//
+/********************************************************************/
+uint8_t Wilduino3G::mgmtGetNwkReg()
+{
+    uint32_t now;
+    drvrSend("AT+CREG?\r\n");
+    now = millis();
+
+    while (drvrElapsedTime(now) < DEFAULT_TIMEOUT)
+    {
+        if (ser->available() > 0)
+        {
+            String str = ser->readStringUntil('\n');
+            
+            if (str.indexOf("+CREG:") != -1)
+            {
+                String substr = str.substring(str.indexOf(',')+1, str.indexOf('\n'));
+                substr.trim();
+                return substr.toInt();
+            }
+        }
+    }    
+    return 0;
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // HTTP related functions
@@ -574,7 +727,7 @@ int8_t Saboten3G::mgmtGetRSSI()
 //
 //
 /********************************************************************/
-boolean Saboten3G::httpOpen(const char *url, uint16_t port)
+int8_t Wilduino3G::httpOpen(const char *url, uint16_t port)
 {
     for (retries=0; retries<MAX_HTTP_RETRIES; retries++)
     {
@@ -584,11 +737,11 @@ boolean Saboten3G::httpOpen(const char *url, uint16_t port)
         ser->print(tmp);
         if (drvrCheckResp("+CHTTPACT: REQUEST\r\n", 7000))
         {
-            return true;
+            return retries;
         }
     }
     dbg->print("Opening site failed\n");
-    return false;
+    return -1;
 }
 
 /********************************************************************/
@@ -596,22 +749,27 @@ boolean Saboten3G::httpOpen(const char *url, uint16_t port)
 //
 //
 /********************************************************************/
-boolean Saboten3G::httpSend(const char *dir, const char *url, const char *data, uint16_t len)
+boolean Wilduino3G::httpSend(const char *dir, const char *url, const char *data, uint16_t len)
 {
     char httpReq[1000];
 
-    sprintf(httpReq, "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: text/csv\r\nCache-Control: no-cache\r\nContent-Length: %d\r\n\r\n%s\r\n\r\n", dir, url, len, data);
+    sprintf(httpReq, "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: text/csv\r\nContent-Length: %d\r\n\r\n%s\r\n\r\n", dir, url, len, data);
+    dbg->print(httpReq);
     ser->print(httpReq);
     ser->write(CTRLZ); // terminate request
 
-    if (drvrCheckResp("http/1.0 200 ok\r\n", DEFAULT_TIMEOUT))
+    if (drvrCheckResp("http/1.1 201 created\r\n", DEFAULT_TIMEOUT))
     {
+        delay(1000);
+        ser->flush();
         return true;
     }
     else
     {
+        delay(1000);
+        ser->flush();
         return false;
-    }
+    }           
 }
 
 /********************************************************************/
@@ -619,7 +777,7 @@ boolean Saboten3G::httpSend(const char *dir, const char *url, const char *data, 
 //
 //
 /********************************************************************/
-boolean Saboten3G::httpGet(const char *dir, const char *url)
+boolean Wilduino3G::httpGet(const char *dir, const char *url)
 {
     char httpReq[500];
     sprintf(httpReq, "GET %s HTTP/1.1\r\nHost: %s\r\nContent-Length: 0\r\n\r\n", dir, url);
@@ -633,12 +791,13 @@ boolean Saboten3G::httpGet(const char *dir, const char *url)
 //
 //
 /********************************************************************/
-boolean Saboten3G::httpResp(const char *resp)
+boolean Wilduino3G::httpResp(const char *resp)
 {
     if (drvrCheckResp(resp, DEFAULT_TIMEOUT))
     {
         return true;
     }
+    return false;
 }
 
 /********************************************************************/
@@ -647,7 +806,7 @@ boolean Saboten3G::httpResp(const char *resp)
 //
 /********************************************************************/
 /*
-void Saboten3G::httpOpenSession(const char *url, uint16_t port, boolean ssl)
+void Wilduino3G::httpOpenSession(const char *url, uint16_t port, boolean ssl)
 {    
     sprintf(tmp, "AT+CHTTPSOPSE=\"%s\", %d, %d\r\n", port, ssl+1);
     ser->print(tmp);
@@ -659,7 +818,7 @@ void Saboten3G::httpOpenSession(const char *url, uint16_t port, boolean ssl)
 //
 /********************************************************************/
 /*
-void Saboten3G::httpSend(const char *data, uint32_t timeout)
+void Wilduino3G::httpSend(const char *data, uint32_t timeout)
 {
     uint16_t len = strlen(data);
     sprintf(tmp, "AT+CHTTPSSEND=%s\r\n", len);
@@ -679,7 +838,7 @@ void Saboten3G::httpSend(const char *data, uint32_t timeout)
 //
 /********************************************************************/
 /*
-void Saboten3G::httpRecv(uint16_t size)
+void Wilduino3G::httpRecv(uint16_t size)
 {
   char buf[100];
   sprintf(buf, "AT+CHTTPSRECV=%d\r\n", size);
@@ -687,116 +846,6 @@ void Saboten3G::httpRecv(uint16_t size)
 }
 */
 
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// GPS related functions
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-/**************************************************************************/
-// Full power down of GPS. This shuts down power to GPS.
-/**************************************************************************/
-void Saboten3G::gpsEnable()
-{
-    digitalWrite(pinGpsEnb, HIGH);
-}
-
-/**************************************************************************/
-// Full power up of GPS. This turns on power to the module
-/**************************************************************************/
-void Saboten3G::gpsDisable()
-{
-    digitalWrite(pinGpsEnb, LOW);
-}
-
-/**************************************************************************/
-// Turn off RF section of GPS. This is not full power down. It will still
-// maintain memory
-/**************************************************************************/
-void Saboten3G::gpsRadioOff()
-{
-    uint8_t GPSoff[] = {0xB5, 0x62, 0x06, 0x04, 0x04, 0x00, 0x00, 0x00,0x08, 0x00, 0x16, 0x74};
-    gpsSendUBX(GPSoff, sizeof(GPSoff)/sizeof(uint8_t));
-}
-
-/**************************************************************************/
-// Turn n RF section of GPS. It will still retain memory.
-/**************************************************************************/
-void Saboten3G::gpsRadioOn()
-{
-    uint8_t GPSon[] = {0xB5, 0x62, 0x06, 0x04, 0x04, 0x00, 0x00, 0x00,0x09, 0x00, 0x17, 0x76};
-    gpsSendUBX(GPSon, sizeof(GPSon)/sizeof(uint8_t));
-}
-
-/**************************************************************************/
-//drain received data from gps port
-/**************************************************************************/
-void Saboten3G::gpsFlush()
-{
-    while (gps->available())
-    {
-        gps->read();        
-    }
-}
-
-/**************************************************************************/
-// 
-/**************************************************************************/
-void Saboten3G::gpsQuiet()
-{
-  gps->println("$PUBX,40,GGA,0,0,0,0*5A");
-  gps->println("$PUBX,40,GSA,0,0,0,0*4E");
-  gps->println("$PUBX,40,RMC,0,0,0,0*47");
-  gps->println("$PUBX,40,GSV,0,0,0,0*59");
-  gps->println("$PUBX,40,VTG,0,0,0,0*5E");
-  gps->println("$PUBX,40,GLL,0,0,0,0*5C");
-}
-
-/********************************************************************/
-//
-/********************************************************************/ 
-void Saboten3G::gpsPowerSaveMode() 
-{
-  //Set GPS to Power Save Mode
-  uint8_t setPSM[] = { 0xB5, 0x62, 0x06, 0x11, 0x02, 0x00, 0x08, 0x01, 0x1A, 0x9D };
-  gpsSendUBX(setPSM, sizeof(setPSM)/sizeof(uint8_t));
-}
-
-
-/**************************************************************************/
-// 
-/**************************************************************************/
-void Saboten3G::gpsPoll()
-{
-    gps->println("$PUBX,00*33");
-}
-
-/**************************************************************************/
-// 
-/**************************************************************************/
-void Saboten3G::gpsPollTime()
-{
-    gps->println("$PUBX,04*37");
-}
-
-/**************************************************************************/
-// 
-/**************************************************************************/
-void Saboten3G::gpsRead(char *data)
-{
-    DBG_PRINTLN("TODO: Getting GPS Data");
-    const char *gps = "This is the GPS Data";
-    memcpy(data, gps, strlen(gps)+1);
-}
-
-/********************************************************************/
-// Send a byte array of UBX protocol to the GPS
-/********************************************************************/
-void Saboten3G::gpsSendUBX(uint8_t *msg, uint8_t len) 
-{
-  for(int i=0; i<len; i++) 
-  {
-    gps->write(msg[i]);
-  }
-}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // RTC related functions
@@ -805,7 +854,7 @@ void Saboten3G::gpsSendUBX(uint8_t *msg, uint8_t len)
 /**************************************************************************/
 // 
 /**************************************************************************/
-void Saboten3G::rtcSetTime(int yr, int mon, int day, int hour, int min, int sec)
+void Wilduino3G::rtcSetTime(int yr, int mon, int day, int hour, int min, int sec)
 {
     struct ts time;
     memset(&time, 0, sizeof(time));
@@ -822,7 +871,7 @@ void Saboten3G::rtcSetTime(int yr, int mon, int day, int hour, int min, int sec)
 /**************************************************************************/
 // 
 /**************************************************************************/
-struct ts Saboten3G::rtcGetTime()
+struct ts Wilduino3G::rtcGetTime()
 {
     struct ts time;
     DS3231_get(&time);
@@ -832,7 +881,7 @@ struct ts Saboten3G::rtcGetTime()
 /**************************************************************************/
 // 
 /**************************************************************************/
-void Saboten3G::rtcPrintTime(char *datetime)
+void Wilduino3G::rtcPrintTime(char *datetime)
 {
   struct ts time = rtcGetTime();
   memset(tmp, 0, sizeof(tmp));
@@ -843,7 +892,7 @@ void Saboten3G::rtcPrintTime(char *datetime)
 /**************************************************************************/
 // 
 /**************************************************************************/
-void Saboten3G::rtcPrintDate(char *datetime)
+void Wilduino3G::rtcPrintDate(char *datetime)
 {
   struct ts time = rtcGetTime();
   memset(tmp, 0, sizeof(tmp));
@@ -855,7 +904,7 @@ void Saboten3G::rtcPrintDate(char *datetime)
 /**************************************************************************/
 // 
 /**************************************************************************/
-void Saboten3G::rtcPrintTimeAndDate(char *datetime)
+void Wilduino3G::rtcPrintTimeAndDate(char *datetime)
 {
   struct ts time = rtcGetTime();
   memset(tmp, 0, sizeof(tmp));
@@ -866,7 +915,7 @@ void Saboten3G::rtcPrintTimeAndDate(char *datetime)
 /**************************************************************************/
 // 
 /**************************************************************************/
-void Saboten3G::rtcPrintFullTime(char *datetime)
+void Wilduino3G::rtcPrintFullTime(char *datetime)
 {
   struct ts time = rtcGetTime();
   memset(tmp, 0, sizeof(tmp));
@@ -877,7 +926,7 @@ void Saboten3G::rtcPrintFullTime(char *datetime)
 /**************************************************************************/
 // 
 /**************************************************************************/
-void Saboten3G::rtcSetAlarm(uint8_t alarm, uint8_t day, uint8_t hour, uint8_t min, uint8_t sec, uint8_t repeat)
+void Wilduino3G::rtcSetAlarm(uint8_t alarm, uint8_t day, uint8_t hour, uint8_t min, uint8_t sec, uint8_t repeat)
 {
     uint8_t i;
     uint8_t flags[5] = {0};
@@ -934,7 +983,7 @@ void Saboten3G::rtcSetAlarm(uint8_t alarm, uint8_t day, uint8_t hour, uint8_t mi
 /**************************************************************************/
 // 
 /**************************************************************************/
-void Saboten3G::rtcGetAlarm(uint8_t alarm, uint8_t *data)
+void Wilduino3G::rtcGetAlarm(uint8_t alarm, uint8_t *data)
 {
     uint8_t addr;
     switch (alarm)
@@ -965,7 +1014,7 @@ void Saboten3G::rtcGetAlarm(uint8_t alarm, uint8_t *data)
 /**************************************************************************/
 // 
 /**************************************************************************/
-uint8_t Saboten3G::rtcGetControl()
+uint8_t Wilduino3G::rtcGetControl()
 {
     return DS3231_get_creg();
 }
@@ -973,7 +1022,7 @@ uint8_t Saboten3G::rtcGetControl()
 /**************************************************************************/
 // 
 /**************************************************************************/
-uint8_t Saboten3G::rtcGetStatus()
+uint8_t Wilduino3G::rtcGetStatus()
 {
     return DS3231_get_sreg();
 }
@@ -981,7 +1030,7 @@ uint8_t Saboten3G::rtcGetStatus()
 /**************************************************************************/
 // 
 /**************************************************************************/
-void Saboten3G::rtcSetStatus(uint8_t reg)
+void Wilduino3G::rtcSetStatus(uint8_t reg)
 {
     DS3231_set_sreg(reg);
     return;
@@ -990,7 +1039,7 @@ void Saboten3G::rtcSetStatus(uint8_t reg)
 /**************************************************************************/
 // 
 /**************************************************************************/
-void Saboten3G::rtcClearAlarm(uint8_t alarm)
+void Wilduino3G::rtcClearAlarm(uint8_t alarm)
 {
 
     switch (alarm)
@@ -1011,7 +1060,7 @@ void Saboten3G::rtcClearAlarm(uint8_t alarm)
 /**************************************************************************/
 // 
 /**************************************************************************/
-void Saboten3G::rtcEnableAlarm(uint8_t alarm)
+void Wilduino3G::rtcEnableAlarm(uint8_t alarm)
 {
     uint8_t reg;
     switch (alarm)
@@ -1035,7 +1084,7 @@ void Saboten3G::rtcEnableAlarm(uint8_t alarm)
 /**************************************************************************/
 // 
 /**************************************************************************/
-void Saboten3G::rtcDisableAlarm(uint8_t alarm)
+void Wilduino3G::rtcDisableAlarm(uint8_t alarm)
 {
     uint8_t reg = DS3231_get_addr(DS3231_INTCN);
 
@@ -1058,10 +1107,10 @@ void Saboten3G::rtcDisableAlarm(uint8_t alarm)
 /**************************************************************************/
 // 
 /**************************************************************************/
-uint8_t Saboten3G::rtcGetTemp()
+float Wilduino3G::rtcGetTemp()
 {
     float temp = DS3231_get_treg();
-    return round(temp);
+    return temp;
 }
 
 
@@ -1072,7 +1121,7 @@ uint8_t Saboten3G::rtcGetTemp()
 /**************************************************************************/
 // 
 /**************************************************************************/
-boolean Saboten3G::sdBegin(uint8_t csPin)
+boolean Wilduino3G::sdBegin(uint8_t csPin)
 {
     boolean st = sd.begin(csPin, SPI_HALF_SPEED);
     if (!st)
@@ -1086,7 +1135,7 @@ boolean Saboten3G::sdBegin(uint8_t csPin)
 /**************************************************************************/
 // 
 /**************************************************************************/
-boolean Saboten3G::sdOpen(const char *filename, uint8_t mode)
+boolean Wilduino3G::sdOpen(const char *filename, uint8_t mode)
 {
     return file.open(filename, mode);
 }
@@ -1094,7 +1143,7 @@ boolean Saboten3G::sdOpen(const char *filename, uint8_t mode)
 /**************************************************************************/
 // 
 /**************************************************************************/
-void Saboten3G::sdLs()
+void Wilduino3G::sdLs()
 {
     sd.ls(LS_R);
 }
@@ -1102,7 +1151,7 @@ void Saboten3G::sdLs()
 /**************************************************************************/
 // 
 /**************************************************************************/
-int16_t Saboten3G::sdRead()
+int16_t Wilduino3G::sdRead()
 {
     return file.read();
 }
@@ -1110,7 +1159,7 @@ int16_t Saboten3G::sdRead()
 /**************************************************************************/
 // 
 /**************************************************************************/
-boolean Saboten3G::sdWrite(const char *data)
+void Wilduino3G::sdWrite(const char *data)
 {
     file.print(data);
 }
@@ -1118,7 +1167,7 @@ boolean Saboten3G::sdWrite(const char *data)
 /**************************************************************************/
 // 
 /**************************************************************************/
-boolean Saboten3G::sdClose()
+void Wilduino3G::sdClose()
 {
     file.close();
 }
@@ -1126,16 +1175,15 @@ boolean Saboten3G::sdClose()
 /**************************************************************************/
 // 
 /**************************************************************************/
-boolean Saboten3G::sdRemove(const char *filename)
+void Wilduino3G::sdRemove(const char *filename)
 {
     sd.remove(filename);
 }
 
-
 /**************************************************************************/
 // 
 /**************************************************************************/
-uint32_t Saboten3G::sdAvailable()
+uint32_t Wilduino3G::sdAvailable()
 {
     return file.available();
 }
@@ -1143,7 +1191,7 @@ uint32_t Saboten3G::sdAvailable()
 /**************************************************************************/
 // 
 /**************************************************************************/
-boolean Saboten3G::sdMkDir(const char *filepath)
+boolean Wilduino3G::sdMkDir(const char *filepath)
 {
     return sd.mkdir(filepath);
 }
@@ -1151,7 +1199,7 @@ boolean Saboten3G::sdMkDir(const char *filepath)
 /**************************************************************************/
 // 
 /**************************************************************************/
-boolean Saboten3G::sdChDir(const char *filepath)
+boolean Wilduino3G::sdChDir(const char *filepath)
 {
     return sd.chdir(filepath);
 }
@@ -1159,7 +1207,7 @@ boolean Saboten3G::sdChDir(const char *filepath)
 /**************************************************************************/
 // 
 /**************************************************************************/
-boolean Saboten3G::sdExists(const char *filename)
+boolean Wilduino3G::sdExists(const char *filename)
 {
     return sd.exists(filename);
 }
@@ -1167,7 +1215,37 @@ boolean Saboten3G::sdExists(const char *filename)
 /**************************************************************************/
 // 
 /**************************************************************************/
-void Saboten3G::sdDateTime(uint16_t *date, uint16_t *time)
+void Wilduino3G::sdLogMsg(const char *filename, const char *msg)
+{
+    if (sdOpen(filename))
+    {
+        sdWrite(msg);
+        dbg->print(msg);
+        sdClose();
+    }
+}
+
+/**************************************************************************/
+// 
+/**************************************************************************/
+void Wilduino3G::sdLogTimestampedMsg(const char *filename, const char *msg)
+{
+    char errBuf[500];
+    struct ts time = rtcGetTime();
+
+    if (sdOpen(filename))
+    {
+        sprintf(errBuf, "%04d/%02d/%02d,%02d:%02d:%02d - %s.\n", time.year, time.mon, time.mday, time.hour, time.min, time.sec, msg);
+        sdWrite(errBuf);
+        dbg->print(errBuf);
+        sdClose();
+    }
+}
+
+/**************************************************************************/
+// 
+/**************************************************************************/
+void Wilduino3G::sdDateTime(uint16_t *date, uint16_t *time)
 {
     struct ts now = rtcGetTime();
 
@@ -1177,56 +1255,3 @@ void Saboten3G::sdDateTime(uint16_t *date, uint16_t *time)
     // return time using FAT_TIME macro to format fields
     *time = FAT_TIME(now.hour, now.min, now.sec);
 }
-
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Level sensor related functions
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-/**************************************************************************/
-// 
-/**************************************************************************/
-void Saboten3G::levelOn()
-{
-    digitalWrite(pinLevelEnb, HIGH);
-}
-
-/**************************************************************************/
-// 
-/**************************************************************************/
-void Saboten3G::levelOff()
-{
-    digitalWrite(pinLevelEnb, LOW);
-}
-
-/**************************************************************************/
-// 
-/**************************************************************************/
-uint32_t Saboten3G::levelRead()
-{   
-    uint32_t val = 0;
-
-    levelOn();
-    digitalWrite(pinArefEnb, HIGH);
-    delay(500);
-
-    float raw = analogRead(pinLevelSensor);
-    raw *= 5.004 * (AREF/VCC);  // datasheet spec: 5120 counts max / 1023 counts max for Arduino ADC = 5.004
-    val = raw;
-    // average level readings over 10 readings
-      
-/*
-    for (int i=0; i<16; i++)
-    {
-        float raw = analogRead(pinLevelSensor);
-        raw *= 5.004 * (AREF/VCC);  // datasheet spec: 5120 counts max / 1023 counts max for Arduino ADC = 5.004
-        val += raw;  
-    }
-    val >>= 4; // divide by 16
-*/
-    levelOff();
-    digitalWrite(pinArefEnb, LOW);
-    return val;
-}
-
-
-

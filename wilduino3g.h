@@ -18,16 +18,14 @@
 #include <avr/eeprom.h>
 #include <limits.h>
 #include <Wire.h>
-#include <SoftwareSerial.h>
 #include <SdFat.h>
-#include "ds3231.h"
+#include <ds3231.h>
 
 #define RESP_SZ 200
 #define DEV_ID_EEPROM_LOC 0x00
 #define DEFAULT_TIMEOUT 5000
 #define MAX_HTTP_RETRIES 5
-#define POWER_RETRIES 5
-#define RTC_INTP 2
+#define MAX_POWER_RETRIES 5
 #define VCC 3.3
 #define AREF 2.5
 #define CTRLZ 0x1A
@@ -59,29 +57,37 @@ enum
     HOUR_ALARM = 2
 };
 
-class Saboten3G 
+enum
+{
+    STATE_MODULE_POWER_OFF = 0,
+    STATE_MODULE_POWER_ON,
+    STATE_MODULE_POWER_ON_WAIT,
+    STATE_MODULE_READY,
+    STATE_MODULE_SHUTTING_DOWN
+};
+
+class Wilduino3G 
 {
 public:
     // inputs
-    const uint8_t pinPwrStatus     = 15;
-    const uint8_t pinRI            = 23;
-    const uint8_t pinVsolSense     = 28;
-    const uint8_t pinNwkStatus     = 29;
-    const uint8_t pinVbatSense     = 31;
-    const uint8_t pinCdet          = 18;
+    const uint8_t pinPwrStatus      = 15;
+    const uint8_t pinRI             = 23;
+    const uint8_t pinVsolSense      = 28;
+    const uint8_t pinNwkStatus      = 29;
+    const uint8_t pinVbatSense      = 31;
 
     // outputs
-    const uint8_t pinWake          = 14;
-    const uint8_t pinPwrButton     = 21;
-    const uint8_t pinDtr           = 22;
-    const uint8_t pinFlightMode    = 30;
-    const uint8_t pinRtcIntp       = 6;
-    const uint8_t pin3GRstN        = 8;
-    const uint8_t pinSdSeln        = 19;
-    const uint8_t pinLevelSensor   = 24;
-    const uint8_t pinGpsEnb        = 25;
-    const uint8_t pinLevelEnb      = 27;
-    const uint8_t pinArefEnb       = 20;
+    const uint8_t pinWake           = 14;
+    const uint8_t pinPwrButton      = 21;
+    const uint8_t pinDtr            = 22;
+    const uint8_t pinFlightMode     = 30;
+    const uint8_t pinRtcIntp        = 6;
+    const uint8_t pin3GRstN         = 8;
+    const uint8_t pinSdSeln         = 19;
+    const uint8_t pinLevelSensor    = 24;
+    const uint8_t pinArefEnb        = 20;
+
+    const uint8_t intpNumRtc        = 2;
 
     char respBuf[RESP_SZ];
     uint8_t rssi;
@@ -90,8 +96,8 @@ public:
     SdFat sd;
     SdFile file;
 
-    Saboten3G();
-    boolean begin(HardwareSerial *port, SoftwareSerial *lvl, HardwareSerial *debug);
+    Wilduino3G();
+    boolean begin(HardwareSerial *port, HardwareSerial *debug);
     uint8_t getIntp();
     static void rtcIntp();
     boolean rtcIntpRcvd();
@@ -105,8 +111,10 @@ public:
     void drvrSleepMcu();
     uint32_t drvrElapsedTime(uint32_t);
     void drvrCmdEcho(boolean enable);
-    boolean drvrPowerOn();
+    void drvrTogglePower();
     boolean drvrPowerOff();
+    boolean drvrInitDone();
+    boolean drvrCheckReady();
     boolean drvrReset();
     void drvrHardReset();
     void drvrFlightMode(boolean enable);
@@ -117,9 +125,9 @@ public:
 
     void mgmtGetInfo();
     int8_t mgmtGetRSSI();
+    uint8_t mgmtGetNwkReg();
 
-
-    boolean httpOpen(const char *url, uint16_t port);
+    int8_t httpOpen(const char *url, uint16_t port);
     boolean httpSend(const char *dir, const char *url, const char *data, uint16_t len);
     boolean httpGet(const char *dir, const char *url);
     boolean httpResp(const char *resp);
@@ -136,10 +144,12 @@ public:
     boolean sdExists(const char *filepath);
     boolean sdChDir(const char *filepath);    
     int16_t sdRead();
-    boolean sdWrite(const char *data);
-    boolean sdClose();
-    boolean sdRemove(const char *filename);
+    void sdWrite(const char *data);
+    void sdClose();
+    void sdRemove(const char *filename);
     uint32_t sdAvailable();
+    void sdLogMsg(const char *filename, const char *msg);
+    void sdLogTimestampedMsg(const char *filename, const char *msg);
     static void sdDateTime(uint16_t *date, uint16_t *time);
 
     void rtcSetTime(int yr, int month, int day, int hour, int min, int sec);
@@ -156,25 +166,18 @@ public:
     void rtcClearAlarm(uint8_t alarm);
     void rtcEnableAlarm(uint8_t alarm);
     void rtcDisableAlarm(uint8_t alarm);
-    uint8_t rtcGetTemp();
+    float rtcGetTemp();
 
-    void levelOn();
-    void levelOff();
-    uint32_t levelRead();
+    uint8_t getModuleState();
+    void stateModulePwrOn();
+    void stateModulePwrOff();
+    uint8_t drvrGetPwrStatus();
+    void pollModuleFSM();
 
-    void gpsEnable();
-    void gpsDisable();
-    void gpsRead(char *data);
-    void gpsQuiet();
-    void gpsRadioOn();
-    void gpsRadioOff();
-    void gpsFlush();
-    void gpsPoll();
-    void gpsPollTime();
-    void gpsSendUBX(uint8_t *msg, uint8_t len);
-    void gpsPowerSaveMode();
+
+private:
+
 
     HardwareSerial *ser;
     HardwareSerial *dbg;
-    SoftwareSerial *gps;
 };
